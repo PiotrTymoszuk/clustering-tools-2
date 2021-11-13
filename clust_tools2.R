@@ -6,7 +6,7 @@
   require(philentropy)
   require(factoextra)
   require(dendextend)
-  require(scrime)
+  require(nomclust)
   require(cluster)
   require(pcaPP)
   require(dbscan)
@@ -151,8 +151,9 @@
     if(method == 'smc') {
       
       dist_mtx <- data %>% 
-        as.matrix %>% 
-        smc(dist = T)
+        as.data.frame %>% 
+        sm %>% 
+        as.matrix
       
       
     } else {
@@ -507,6 +508,32 @@
     
   }
   
+  vote_simple <- function(vector) {
+    
+    ## returns the majority class present in a vector
+    
+    voting_res <- table(vector)
+    
+    names(voting_res)[1]
+    
+  }
+  
+  vote_kernel <- function(vector, dist_vec, kernel_fun = function(x) 1/x) {
+    
+    ## distance weighted voting
+    
+    vote_tbl <- tibble(raw_votes = vector, 
+                       distances = dist_vec, 
+                       weighted_votes = kernel_fun(dist_vec)) %>% 
+      filter(complete.cases(.)) %>% 
+      group_by(raw_votes) %>% 
+      summarise(vote_sum = sum(weighted_votes)) %>% 
+      arrange(-vote_sum)
+    
+    vote_tbl$raw_votes[1]
+    
+  }
+  
 # OOP definitions -----
   
   clust_analysis <- function(x) {
@@ -527,7 +554,7 @@
     stopifnot(is_quosure(x$data))
     stopifnot(is.matrix(x$dist_mtx))
     stopifnot(x$dist.method %in% c(getDistMethods(), 'smc', 'sumofsquares'))
-    stopifnot(x$clust_fun %in% c('hclust', 'kmeans', 'dbscan', 'som', 'pam'))
+    stopifnot(x$clust_fun %in% c('hclust', 'kmeans', 'dbscan', 'som', 'pam', 'prediction'))
     stopifnot(is_tibble(x$clust_assignment))
     stopifnot(all(c('observation', 'clust_id') %in% names(x$clust_assignment)))
     
@@ -751,6 +778,7 @@
     stopifnot(class(clust_analysis_object) == 'clust_analysis')
     
     print(clust_analysis_object$clust_obj)
+    print(clust_analysis_object$clust_assignment)
     
   }
   
@@ -980,7 +1008,8 @@
       switch(hclust = 'Hierarchical clustering', 
              kmeans = 'Kmeans clustering', 
              pam = 'PAM clustering', 
-             som = 'SOM clustering')
+             som = 'SOM clustering', 
+             prediction = 'prediction')
     
     plot_subtitle <- paste0(clust_method, 
                             ', ', 
@@ -1048,9 +1077,15 @@
                                                 plot_tag = plot_tag, 
                                                 cust_theme = cust_theme)
         
-      } else {
+      } else if(clust_analysis_object$clust_fun == 'som') {
         
         plot_list <- plot_som(clust_analysis_object$clust_obj)
+        
+      } else {
+        
+        warning('No training plots available for cluster predictions', call. = FALSE)
+        
+        return(NULL)
         
       }
       
@@ -1269,6 +1304,77 @@
     
   }
   
+# OOP semi-supervised clustering ------
+  
+  predict.clust_analysis <- function(clust_analysis_object, 
+                                     newdata = NULL, 
+                                     type = c('class', 'propagation'), ...) {
+    
+    ## assigns the observations from newdata to the clusters
+    ## class: simple matching by observation names
+    ## propagation: kNN-driven label propagation
+    
+    stopifnot(class(clust_analysis_object) == 'clust_analysis')
+    
+    type <- match.arg(type[1], 
+                      c('class', 'propagation'))
+    
+    if(is.null(newdata)) {
+      
+      return(extract(clust_analysis_object, 'assignment'))
+      
+    }
+    
+    if(type == 'class') {
+      
+      train_assignment <- extract(clust_analysis_object, 'assignment') %>% 
+        column_to_rownames('observation')
+      
+      if(nrow(newdata) != nrow(train_assignment)) {
+        
+        stop('The numbers of rows in new data and the table used for cluster development must be equal', call. = FALSE)
+        
+      }
+      
+      newdata <- as.data.frame(newdata)
+      
+      if(!is.null(rownames(newdata))) {
+        
+        test_assignment <- tibble(observation = rownames(newdata), 
+                                  clust_id = train_assignment[rownames(newdata), 'clust_id'])
+        
+      } else {
+        
+        warning('Unnamed observations in new data')
+        
+        test_assignment <- train_assignment %>% 
+          rownames_to_column('observation') %>%
+          as_tibble
+        
+      }
+      
+      ## output
+      
+      model_frame <- enexpr(newdata)
+      
+      list(data = quo(model_frame), 
+           dist_mtx = calculate_dist(newdata, method = clust_analysis_object$dist_method), 
+           dist_method = clust_analysis_object$dist_method, 
+           clust_fun = 'prediction', 
+           clust_obj = NULL, 
+           clust_assignment = test_assignment) %>% 
+        clust_analysis
+      
+    } else {
+      
+      propagate(clust_analysis_object = clust_analysis_object, 
+                newdata = newdata, 
+                distance_method = clust_analysis_object$dist_method, ...)
+      
+    }
+    
+  }
+  
 # hierarchical, kmeans, pam, dbscan and som clustering -----
   
   get_clust_tendency <- function(data, n, seed = 1234, ...) {
@@ -1351,7 +1457,8 @@
     ## distance calculation
     
     dist_mtx <- calculate_dist(data = data, 
-                               method = distance_method)
+                               method = distance_method) %>% 
+      as.dist
     
     ## kmeans/pam clustering and cluster assignment table
     
@@ -1368,7 +1475,7 @@
     model_frame <- enexpr(data)
 
     list(data = quo(model_frame), 
-         dist_mtx = dist_mtx, 
+         dist_mtx = as.matrix(dist_mtx), 
          dist_method = distance_method, 
          clust_fun = clust_fun, 
          clust_obj = kclust_str, 
@@ -1597,6 +1704,128 @@
          component_tbl = component_tbl, 
          loadings = loadings) %>% 
       red_analysis
+    
+  }
+  
+# semi-supervised learning -----
+  
+  propagate <- function(clust_analysis_object, 
+                        newdata = NULL, 
+                        distance_method = clust_analysis_object$dist_method, 
+                        k = 5, 
+                        simple_vote = TRUE, 
+                        kernel_fun = function(x) 1/x, 
+                        detailed = FALSE) {
+    
+    ## predicts cluster assignment by k-NN driven label propagation
+    ## simple_vote: classical kNN prediction, ties are resolved by returning the first element otherwise, distance weighting
+    ## detailed: kNN calculation results (distance, ids and labels are returned as well)
+    ## value: a clust_analysis object
+    
+    if(class(clust_analysis_object) != 'clust_analysis') {
+      
+      stop('A valid clust_analysis object required')
+      
+    }
+    
+    if(is.null(newdata)) {
+      
+      return(extract(clust_analysis_object, 'assignment'))
+      
+    }
+
+    ## extracting the training data set, constrained to the cases with the cluster assignment (non-NA)
+    
+    train_set <- extract(clust_analysis_object, type = 'data') %>% 
+      as.matrix
+    
+    if(ncol(train_set) != ncol(newdata)) {
+      
+      stop('The numbers of columns in new data and the table used for cluster development must be equal', call. = FALSE)
+      
+    }
+    
+    rownames(train_set) <- paste0('train_', 1:nrow(train_set))
+    
+    train_assign <- extract(clust_analysis_object, type = 'assignment') %>% 
+      mutate(.rowname = rownames(train_set)) %>% 
+      filter(!is.na(clust_id))
+    
+    label_vec <- set_names(train_assign$clust_id, 
+                           train_assign$.rowname)
+    
+    train_set <- train_set[train_assign$.rowname, ]
+    
+    ## constructing the mixed test-train matrix and calculating a distance object
+    
+    if(is.null(rownames(newdata))) {
+      
+      rownames(newdata) <- paste0('test_', 1:nrow(train_set))
+      
+    }
+    
+    mix_set <- rbind(train_set, as.matrix(newdata))
+    
+    mix_diss <- calculate_dist(data = mix_set, 
+                               method = distance_method)
+    
+    ## kNN calulation and label assingment
+    
+    knn_dists <- kNN(as.dist(mix_diss), k = k)
+    
+    knn_test <- list(dist = knn_dists$dist[rownames(newdata), ], 
+                     id = knn_dists$id[rownames(newdata), ])
+    
+    knn_test$annot_id <- matrix(rownames(mix_diss)[knn_test$id], ncol = k)
+    rownames(knn_test$annot_id) <- rownames(knn_test$id)
+    
+    knn_test$labels <- matrix(label_vec[knn_test$annot_id], ncol = k)
+    rownames(knn_test$labels) <- rownames(knn_test$id)
+    
+    ## voting
+    
+    if(simple_vote) {
+      
+      clust_assignment <- rownames(knn_test$labels) %>% 
+        map(~vote_simple(knn_test$labels[.x, ])) %>% 
+        unlist
+      
+    } else {
+      
+      clust_assignment <- rownames(knn_test$labels) %>% 
+        map(~vote_kernel(vector = knn_test$labels[.x, ], 
+                         dist_vec = knn_test$dist[.x, ], 
+                         kernel_fun = kernel_fun)) %>% 
+        unlist
+      
+    }
+    
+    ## output
+    
+    #return(list(clust_assignment, 
+         #       knn_test[c('dist', 'id', 'labels')]))
+    
+    model_frame <- enexpr(newdata)
+    
+    clust_analysis_out <- list(data = quo(model_frame), 
+                               dist_mtx = as.matrix(mix_diss)[rownames(newdata), rownames(newdata)], 
+                               dist_method = distance_method, 
+                               clust_fun = 'prediction', 
+                               clust_obj = NULL, 
+                               clust_assignment = tibble(observation = rownames(knn_test$labels), 
+                                                         clust_id = factor(clust_assignment))) %>% 
+      clust_analysis
+    
+    if(!detailed) {
+      
+      return(clust_analysis_out)
+      
+    } else {
+      
+      return(list(knn = knn_test[c('dist', 'id', 'labels')], 
+                  clust_analysis_object = clust_analysis_out))
+      
+    }
     
   }
   
