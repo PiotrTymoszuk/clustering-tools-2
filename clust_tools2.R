@@ -16,6 +16,8 @@
   require(grDevices)
   require(cowplot)
   require(ggrepel)
+  require(coxed)
+  require(caret)
 
   map <- purrr::map
 
@@ -128,6 +130,35 @@
     new DistanceFunctionPtr(&myCosineDef));
   }'
   
+  kernels$dice_code <- '#include <Rcpp.h>
+    typedef double (*DistanceFunctionPtr)(double *, double *, int, int);
+
+    double myDiceDef(double *data, double *codes, int n, int nNA) {
+      if (nNA > 0) return NA_REAL;
+
+      double num = 0.0;
+      double denom1 = 0.0;
+      double denom2 = 0.0;
+      double dice = 0.0;
+      
+      for (int i = 0; i < n; i++) {
+        num += (data[i] - codes[i]) * (data[i] - codes[i]);
+        denom1 += data[i] * data[i];
+        denom2 += codes[i] * codes[i];
+      }
+      
+      dice = num/(denom1 + denom2);
+
+      return dice;
+        
+    }
+
+  // [[Rcpp::export]]
+  Rcpp::XPtr<DistanceFunctionPtr> dice() {
+    return Rcpp::XPtr<DistanceFunctionPtr>(
+    new DistanceFunctionPtr(&myDiceDef));
+  }'
+  
   
   kernels %>% 
     walk(function(x) sourceCpp(code = x))
@@ -155,13 +186,15 @@
         sm %>% 
         as.matrix
       
-      
     } else {
+      
+      if(method == 'sumofsquares') method <- 'squared_euclidean'
       
       dist_mtx <- data %>% 
         as.matrix %>% 
         distance(method = method, 
-                 use.row.names = T)
+                 use.row.names = TRUE, 
+                 mute.message = TRUE)
       
       if(method %in% c('cosine', 'ruzicka')) {
         
@@ -512,7 +545,7 @@
     
     ## returns the majority class present in a vector
     
-    voting_res <- table(vector)
+    voting_res <- sort(table(vector), decreasing = TRUE)
     
     names(voting_res)[1]
     
@@ -651,6 +684,18 @@
   ngroups <- function(x, ...) {
     
     UseMethod('ngroups', x)
+    
+  }
+  
+  cv <- function(x, ...) {
+    
+    UseMethod('cv', x)
+    
+  }
+  
+  impact <- function(x, ...) {
+    
+    UseMethod('impact', x)
     
   }
   
@@ -988,7 +1033,8 @@
                                   type = c('diagnostic', 'components', 'heat_map', 'training'), 
                                   cust_theme = theme_classic(), 
                                   jitter_width = 0, 
-                                  jitter_height = 0, ...) {
+                                  jitter_height = 0, 
+                                  point_alpha = 1, ...) {
     
     ## plots diagnostic graphics
     
@@ -1129,7 +1175,8 @@
                  cust_theme = cust_theme, 
                  jitter_height = jitter_height, 
                  jitter_width = jitter_width, 
-                 fill_lab = 'Cluster ID')
+                 fill_lab = 'Cluster ID', 
+                 point_alpha = point_alpha)
       
     } else if(type == 'heat_map') {
       
@@ -1202,7 +1249,8 @@
                                   type = c('diagnostic', 'components', 'heat_map', 'training'), 
                                   cust_theme = theme_classic(), 
                                   jitter_width = 0, 
-                                  jitter_height = 0, ...) {
+                                  jitter_height = 0, 
+                                  point_alpha = 1, ...) {
     
     ## plotting methods for the combi_analysis objects
     
@@ -1262,7 +1310,8 @@
                                     cust_theme = cust_theme, 
                                     jitter_height = jitter_height, 
                                     jitter_width = jitter_width, 
-                                    fill_lab = 'Cluster ID')
+                                    fill_lab = 'Cluster ID', 
+                                    point_alpha = point_alpha)
       
     }
     
@@ -1375,6 +1424,305 @@
     
   }
   
+  predict.combi_analysis <- function(combi_analysis_object, 
+                                     newdata = NULL, 
+                                     type = c('class', 'propagation'), ...) {
+    
+    ## assigns the observations from newdata to the clusters
+    ## class: simple matching by observation names
+    ## propagation: kNN-driven label propagation
+    ## returns a cluster analysis object
+    
+    stopifnot(class(combi_analysis_object) == 'combi_analysis')
+    
+    type <- match.arg(type[1], 
+                      c('class', 'propagation'))
+    
+    if(is.null(newdata)) {
+      
+      return(extract(combi_analysis_object, 'assignment'))
+      
+    }
+    
+    if(type == 'class') {
+      
+      train_assignment <- extract(combi_analysis_object, 'assignment') %>% 
+        column_to_rownames('observation')
+      
+      if(nrow(newdata) != nrow(train_assignment)) {
+        
+        stop('The numbers of rows in new data and the table used for cluster development must be equal', call. = FALSE)
+        
+      }
+      
+      newdata <- as.data.frame(newdata)
+      
+      if(!is.null(rownames(newdata))) {
+        
+        test_assignment <- tibble(observation = rownames(newdata), 
+                                  clust_id = train_assignment[rownames(newdata), 'clust_id'])
+        
+      } else {
+        
+        warning('Unnamed observations in new data')
+        
+        test_assignment <- train_assignment %>% 
+          rownames_to_column('observation') %>%
+          as_tibble
+        
+      }
+      
+      ## output
+      
+      model_frame <- enexpr(newdata)
+      
+      list(data = quo(model_frame), 
+           dist_mtx = calculate_dist(newdata, method = combi_analysis_object$clust_analyses$observation$dist_method), 
+           dist_method = combi_analysis_object$clust_analyses$observation$dist_method, 
+           clust_fun = 'prediction', 
+           clust_obj = NULL, 
+           clust_assignment = test_assignment) %>% 
+        clust_analysis
+      
+    } else {
+      
+      obs_propagation <- propagate(clust_analysis_object = combi_analysis_object$clust_analyses$observation, 
+                                   newdata = newdata, 
+                                   distance_method = combi_analysis_object$clust_analyses$observation$dist_method, ...)
+      
+      obs_propagation <- extract(obs_propagation, 'assignment') %>% 
+        set_names(c('observation', 'node'))
+      
+      node_ass <- extract(combi_analysis_object, 'assignment') %>% 
+        filter(!duplicated(node))
+
+      test_assignment <- left_join(obs_propagation, 
+                node_ass[c('node', 'clust_id')], 
+                by = 'node')
+      
+      ## output
+      
+      model_frame <- enexpr(newdata)
+      
+      list(data = quo(model_frame), 
+           dist_mtx = calculate_dist(newdata, method = combi_analysis_object$clust_analyses$observation$dist_method), 
+           dist_method = combi_analysis_object$clust_analyses$observation$dist_method, 
+           clust_fun = 'prediction', 
+           clust_obj = NULL, 
+           clust_assignment = test_assignment) %>% 
+        clust_analysis
+      
+    }
+    
+  }
+
+# OOP cluster stability -----
+  
+  cv.clust_analysis <- function(clust_analysis_object, 
+                                nfolds = 5, 
+                                nearest_n = 5, 
+                                simple_vote = TRUE, 
+                                kernel_fun = function(x) 1/x, 
+                                seed = 1234) {
+    
+    ## cross validation of an existing clustering object
+    
+    stopifnot(class(clust_analysis_object) == 'clust_analysis')
+    
+    ## common parameters
+    
+    clust_data <- extract(clust_analysis_object, 'data')
+    
+    distance_method <- clust_analysis_object$dist_method
+    
+    if(clust_analysis_object$clust_fun == 'hclust') {
+      
+      cv_call <- call2('cv_cluster', 
+                       data = clust_data, 
+                       nfolds = nfolds, 
+                       nearest_n = nearest_n, 
+                       simple_vote = simple_vote, 
+                       kernel_fun = kernel_fun,
+                       distance_method = distance_method, 
+                       clustering_fun = hcluster, 
+                       seed = seed, 
+                       k = nrow(ngroups(clust_analysis_object)), 
+                       hc_method = clust_analysis_object$hc_method, 
+                       !!!clust_analysis_object$dots)
+      
+    } else if(clust_analysis_object$clust_fun %in% c('kmeans', 'pam')) {
+      
+      cv_call <- call2('cv_cluster', 
+                       data = clust_data, 
+                       nfolds = nfolds, 
+                       nearest_n = nearest_n, 
+                       simple_vote = simple_vote, 
+                       kernel_fun = kernel_fun,
+                       distance_method = distance_method, 
+                       clustering_fun = kcluster, 
+                       clust_fun = clust_analysis_object$clust_fun, 
+                       seed = seed, 
+                       k = nrow(ngroups(clust_analysis_object)), 
+                       !!!clust_analysis_object$dots)
+      
+    } else if(clust_analysis_object$clust_fun == 'som') {
+
+        cv_call <- call2('cv_cluster', 
+                         data = clust_data, 
+                         nfolds = nfolds, 
+                         nearest_n = nearest_n, 
+                         simple_vote = simple_vote, 
+                         kernel_fun = kernel_fun,
+                         distance_method = distance_method, 
+                         clustering_fun = som_cluster, 
+                         seed = seed, 
+                         xdim = clust_analysis_object$grid$xdim, 
+                         ydim = clust_analysis_object$grid$ydim, 
+                         topo = clust_analysis_object$grid$topo, 
+                         neighbourhood.fct = as.character(clust_analysis_object$grid$neighbourhood.fct), 
+                         toroidal = clust_analysis_object$grid$toroidal, 
+                         !!!clust_analysis_object$dots)
+      
+    }
+    
+    eval(cv_call)
+    
+  }
+  
+  cv.combi_analysis <- function(combi_analysis_object, 
+                                nfolds = 5, 
+                                nearest_n = 5, 
+                                simple_vote = TRUE, 
+                                kernel_fun = function(x) 1/x, 
+                                seed = 1234) {
+    
+    ## cross validation of an existing combi object
+    
+    stopifnot(class(combi_analysis_object) == 'combi_analysis')
+    
+    ## common paramaters
+    
+    node_clust_fun <- switch(combi_analysis_object$clust_analyses$node$clust_fun, 
+                             hclust = hcluster, 
+                             kmeans = kcluster, 
+                             pam = kcluster)
+    
+    cv_call <- call2('cv_cluster', 
+                     data = extract(combi_analysis_object$clust_analyses$observation, 'data'), 
+                     nfolds = nfolds, 
+                     nearest_n = nearest_n, 
+                     simple_vote = simple_vote, 
+                     kernel_fun = kernel_fun, 
+                     clustering_fun = combi_cluster, 
+                     seed = seed, 
+                     distance_som = combi_analysis_object$clust_analyses$observation$dist_method,
+                     xdim = combi_analysis_object$clust_analyses$observation$grid$xdim, 
+                     ydim = combi_analysis_object$clust_analyses$observation$grid$ydim, 
+                     topo = combi_analysis_object$clust_analyses$observation$grid$topo, 
+                     neighbourhood.fct = as.character(combi_analysis_object$clust_analyses$observation$grid$neighbourhood.fct), 
+                     toroidal = combi_analysis_object$clust_analyses$observation$grid$toroidal, 
+                     rlen = nrow(combi_analysis_object$clust_analyses$observation$clust_obj$changes), 
+                     node_clust_fun = node_clust_fun, 
+                     distance_nodes = combi_analysis_object$clust_analyses$node$dist_method, 
+                     k = nrow(ngroups(combi_analysis_object$clust_analyses$node)), 
+                     !!!combi_analysis_object$dots)
+    
+    eval(cv_call)
+    
+  }
+  
+# OOP variable importance -----
+  
+  impact.clust_analysis <- function(clust_analysis_object, seed = 1234) {
+    
+    ## gets impact of the clustering variables by noising
+    
+    stopifnot(class(clust_analysis_object) == 'clust_analysis')
+    
+    ## common parameters
+    
+    clust_data <- extract(clust_analysis_object, 'data')
+    
+    distance_method <- clust_analysis_object$dist_method
+    
+    if(clust_analysis_object$clust_fun == 'hclust') {
+      
+      imp_call <- call2('importance_cluster', 
+                       data = clust_data, 
+                       clustering_fun = hcluster, 
+                       distance_method = distance_method, 
+                       seed = seed, 
+                       k = nrow(ngroups(clust_analysis_object)), 
+                       hc_method = clust_analysis_object$hc_method, 
+                       !!!clust_analysis_object$dots)
+      
+    } else if(clust_analysis_object$clust_fun %in% c('kmeans', 'pam')) {
+      
+      imp_call <- call2('importance_cluster', 
+                        data = clust_data, 
+                        clustering_fun = kcluster, 
+                        clust_fun = clust_analysis_object$clust_fun,
+                        distance_method = distance_method, 
+                        seed = seed, 
+                        k = nrow(ngroups(clust_analysis_object)), 
+                        !!!clust_analysis_object$dots)
+      
+
+    } else if(clust_analysis_object$clust_fun == 'som') {
+      
+      imp_call <- call2('importance_cluster', 
+                        data = clust_data, 
+                        clustering_fun = hcluster, 
+                        clust_fun = som_cluster,
+                        distance_method = distance_method, 
+                        seed = seed, 
+                        xdim = clust_analysis_object$grid$xdim, 
+                        ydim = clust_analysis_object$grid$ydim, 
+                        topo = clust_analysis_object$grid$topo, 
+                        neighbourhood.fct = as.character(clust_analysis_object$grid$neighbourhood.fct), 
+                        toroidal = clust_analysis_object$grid$toroidal,
+                        !!!clust_analysis_object$dots)
+
+    }
+    
+    eval(imp_call)
+    
+  }
+  
+  impact.combi_analysis <- function(combi_analysis_object, seed = 1234) {
+    
+    ## gets impact of the clustering variables by noising
+    
+    stopifnot(class(combi_analysis_object) == 'combi_analysis')
+    
+    ## common paramaters
+    
+    node_clust_fun <- switch(combi_analysis_object$clust_analyses$node$clust_fun, 
+                             hclust = hcluster, 
+                             kmeans = kcluster, 
+                             pam = kcluster)
+    
+    imp_call <- call2('importance_cluster', 
+                      data = extract(combi_analysis_object$clust_analyses$observation, 'data'), 
+                      clustering_fun = combi_cluster, 
+                      seed = seed, 
+                      distance_som = combi_analysis_object$clust_analyses$observation$dist_method,
+                      xdim = combi_analysis_object$clust_analyses$observation$grid$xdim, 
+                      ydim = combi_analysis_object$clust_analyses$observation$grid$ydim, 
+                      topo = combi_analysis_object$clust_analyses$observation$grid$topo, 
+                      neighbourhood.fct = as.character(combi_analysis_object$clust_analyses$observation$grid$neighbourhood.fct), 
+                      toroidal = combi_analysis_object$clust_analyses$observation$grid$toroidal, 
+                      rlen = nrow(combi_analysis_object$clust_analyses$observation$clust_obj$changes), 
+                      node_clust_fun = node_clust_fun, 
+                      distance_nodes = combi_analysis_object$clust_analyses$node$dist_method, 
+                      k = nrow(ngroups(combi_analysis_object$clust_analyses$node)), 
+                      !!!combi_analysis_object$dots)
+    
+    eval(imp_call)
+    
+    
+  }
+  
 # hierarchical, kmeans, pam, dbscan and som clustering -----
   
   get_clust_tendency <- function(data, n, seed = 1234, ...) {
@@ -1435,7 +1783,8 @@
          clust_fun = 'hclust', 
          clust_obj = hclust_str, 
          clust_assignment = hclust_ass, 
-         hc_method = hc_method) %>% 
+         hc_method = hc_method, 
+         dots = list2(...)) %>% 
       clust_analysis
     
   }
@@ -1479,7 +1828,8 @@
          dist_method = distance_method, 
          clust_fun = clust_fun, 
          clust_obj = kclust_str, 
-         clust_assignment = kclust_ass) %>% 
+         clust_assignment = kclust_ass, 
+         dots = list2(...)) %>% 
       clust_analysis
     
   }
@@ -1522,7 +1872,8 @@
          clust_obj = kclust_str, 
          clust_assignment = kclust_ass,
          eps = eps, 
-         minPts = minPts) %>% 
+         minPts = minPts, 
+         dots = list2(...)) %>% 
       clust_analysis
     
   }
@@ -1533,7 +1884,7 @@
                           ydim = floor(sqrt(5*sqrt(nrow(data)))), 
                           topo = 'hexagonal', 
                           neighbourhood.fct = 'gaussian', 
-                          toroidal = F, 
+                          toroidal = FALSE, 
                           seed = 1234, ...) {
     
     ## performs SOM clustering of the data
@@ -1571,7 +1922,8 @@
          clust_fun = 'som', 
          clust_obj = kohonen_obj, 
          clust_assignment = node_ass,
-         grid = som_grid) %>% 
+         grid = som_grid, 
+         dots = list2(...)) %>% 
       clust_analysis
 
   }
@@ -1584,7 +1936,7 @@
                             ydim = floor(sqrt(5*sqrt(nrow(data)))), 
                             topo = 'hexagonal', 
                             neighbourhood.fct = 'gaussian', 
-                            toroidal = F, 
+                            toroidal = FALSE, 
                             rlen = NULL, 
                             node_clust_fun = hcluster, 
                             distance_nodes = 'euclidean', 
@@ -1634,7 +1986,8 @@
     
     list(clust_analyses = list(observation = som_clust, 
                                node = node_clust), 
-         clust_assignment = combi_ass) %>% 
+         clust_assignment = combi_ass, 
+         dots = list2(...)) %>% 
       combi_analysis
     
   }
@@ -1745,7 +2098,11 @@
       
     }
     
-    rownames(train_set) <- paste0('train_', 1:nrow(train_set))
+    if(is.null(rownames(train_set))) {
+      
+      rownames(train_set) <- paste0('train_', 1:nrow(train_set))
+      
+    }
     
     train_assign <- extract(clust_analysis_object, type = 'assignment') %>% 
       mutate(.rowname = rownames(train_set)) %>% 
@@ -1799,12 +2156,7 @@
         unlist
       
     }
-    
-    ## output
-    
-    #return(list(clust_assignment, 
-         #       knn_test[c('dist', 'id', 'labels')]))
-    
+
     model_frame <- enexpr(newdata)
     
     clust_analysis_out <- list(data = quo(model_frame), 
@@ -1822,10 +2174,136 @@
       
     } else {
       
-      return(list(knn = knn_test[c('dist', 'id', 'labels')], 
+      return(list(mix_data = mix_set, 
+                  mix_diss = mix_diss, 
+                  knn = knn_test[c('dist', 'id', 'labels')], 
                   clust_analysis_object = clust_analysis_out))
       
     }
+    
+  }
+  
+# cross-validation of the clustering alghorithm stability -----
+  
+  cv_cluster <- function(data,
+                         nfolds = 5, 
+                         nearest_n = 5, 
+                         simple_vote = TRUE, 
+                         kernel_fun = function(x) 1/x, 
+                         clustering_fun = kcluster, 
+                         seed = 1234, ...) {
+    
+    ## tests stability of the clustering algorithm by cross validation
+
+    set.seed(seed = seed)
+    
+    ## data split generation
+    
+    fold_ids <- createFolds(1:nrow(data), k = nfolds)
+    
+    fold_set <- fold_ids %>% 
+      map(~list(train = data[-.x, ], 
+                test = data[.x, ])) %>% 
+      transpose
+    
+    ## defining the global classifier
+    
+    glob_classif <- clustering_fun(data = data, ...)
+    
+    glob_assign <- extract(glob_classif, 'assignment')[c('observation', 'clust_id')] %>%
+      set_names(c('observation', 'global_clust'))
+    
+    ## creating the training set classifiers
+    
+    train_classif <- fold_set$train %>% 
+      map(function(x) clustering_fun(data = x, ...))
+    
+    ## obtaining the predictions and comparing with the global classifier
+    
+    if(class(glob_classif) == 'clust_analysis') {
+      
+      pred_input <- list(clust_analysis_object = train_classif, 
+                         newdata = fold_set$test)
+      
+    } else {
+      
+      pred_input <- list(combi_analysis_object = train_classif, 
+                         newdata = fold_set$test)
+      
+    }
+    
+    test_preds <- pred_input %>% 
+      pmap(safely(predict), 
+           type = 'propagation', 
+           k = nearest_n, 
+           simple_vote = simple_vote, 
+           kernel_fun = kernel_fun) %>% 
+      map(~.x$result) %>% 
+      compact %>% 
+      map(extract, 'assignment')
+    
+    test_preds <- test_preds %>% 
+      map(select, observation, clust_id) %>% 
+      map(set_names, c('observation', 'fold_clust')) %>% 
+      map(left_join, glob_assign, by = 'observation') %>% 
+      map(mutate, correct = as.character(global_clust) == as.character(fold_clust))
+
+    test_stats <- test_preds %>% 
+      map(summarise, 
+          corr_rate = mean(as.numeric(correct), na.rm = TRUE)) %>% 
+      map2_dfr(., names(.), 
+               ~mutate(.x, err_rate = 1 - corr_rate, fold = .y, )) %>% 
+      select(fold, corr_rate, err_rate)
+    
+    bca_err <- bca(test_stats$err_rate)
+    
+    test_summary <- tibble(mean_error = mean(test_stats$err_rate, na.rm = TRUE), 
+                           lower_ci = bca_err[1], 
+                           upper_ci = bca_err[2])
+    
+    test_preds <- test_preds %>% 
+      map2_dfr(., names(.), ~mutate(.x, fold = .y))
+    
+    ## output
+    
+    list(clust_analysis_object = glob_classif, 
+         predictions = test_preds, 
+         fold_stats = test_stats, 
+         summary = test_summary)
+    
+  }
+  
+# variable importance determined by noising -------
+  
+  importance_cluster <- function(data, 
+                                 clustering_fun = kcluster, 
+                                 seed = 1234, ...) {
+    
+    ## determines importance of the clustering variables by noising
+    ## as proposed by Leo Breiman for random forests
+    
+    ## noised set and the unnnoised data
+    
+    noised_set <- names(data) %>% 
+      map(function(x) mutate(data, !!ensym(x) := sample(.data[[x]], size = nrow(data), replace = TRUE))) %>% 
+      set_names(names(data))
+    
+    noised_set <- c(list(data = data), noised_set)
+    
+    ## generating the clustering objects, calculating teh variances
+    
+    var_lst <- noised_set %>% 
+      map(function(x) clustering_fun(data = x, ...)) %>% 
+      map(var) %>% 
+      map(~.x[c('total_wss', 'total_ss', 'between_ss', 'frac_var')]) %>% 
+      map_dfr(as_tibble) %>% 
+      mutate(variable = c('data', names(data)))
+    
+    var_summary <- var_lst[-1, ] %>% 
+      mutate(frac_diff = var_lst$frac_var[1] - frac_var)
+    
+    list(variances = var_lst, 
+         summary = var_summary[c('variable', 'frac_diff')])
     
   }
   
