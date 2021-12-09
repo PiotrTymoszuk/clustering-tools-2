@@ -18,150 +18,19 @@
   require(ggrepel)
   require(coxed)
   require(caret)
+  require(furrr)
+
+  ## additional kernels for kohonen::som()
+
+  tryCatch(library(somKernels), 
+           error = function(e) install.packages('./tools/somKernels.tar', 
+                                                repos = NULL, 
+                                                type = 'source', 
+                                                INSTALL_opts = '--no-help'))
 
   map <- purrr::map
 
   map_som <- kohonen::map
-  
-# C++ distance kernels ------
-  
-  kernels <- list()
-  
-  kernels$BCcode <- '#include <Rcpp.h>
-    typedef double (*DistanceFunctionPtr)(double *, double *, int, int);
-
-    double brayCurtisDissim(double *data, double *codes, int n, int nNA) {
-      if (nNA > 0) return NA_REAL;
-
-      double num = 0.0, denom = 0.0;
-      
-      for (int i = 0; i < n; i++) {
-        num += std::abs(data[i] - codes[i]);
-        denom += data[i] + codes[i];
-      }
-
-      return num/denom;
-        
-    }
-
-  // [[Rcpp::export]]
-  Rcpp::XPtr<DistanceFunctionPtr> BrayCurtis() {
-    return Rcpp::XPtr<DistanceFunctionPtr>(
-    new DistanceFunctionPtr(&brayCurtisDissim));
-  }'
-  
-  kernels$smc_code <- '#include <Rcpp.h>
-    typedef double (*DistanceFunctionPtr)(double *, double *, int, int);
-
-    double mySMCdef(double *data, double *codes, int n, int nNA) {
-      if (nNA > 0) return NA_REAL;
-
-      double num = 0.0;
-      
-      for (int i = 0; i < n; i++) {
-        num += std::abs(data[i] - codes[i]);
-      }
-
-      return num/n;
-        
-    }
-
-  // [[Rcpp::export]]
-  Rcpp::XPtr<DistanceFunctionPtr> smc() {
-    return Rcpp::XPtr<DistanceFunctionPtr>(
-    new DistanceFunctionPtr(&mySMCdef));
-  }'
-  
-  kernels$jaccard_code <- '#include <Rcpp.h>
-    typedef double (*DistanceFunctionPtr)(double *, double *, int, int);
-
-    double myJaccardDef(double *data, double *codes, int n, int nNA) {
-      if (nNA > 0) return NA_REAL;
-
-      double num = 0.0;
-      double denom1 = 0.0;
-      double denom2 = 0.0;
-      double jacc = 0.0;
-      
-      for (int i = 0; i < n; i++) {
-        num += data[i] * codes[i];
-        denom1 += data[i] * data[i];
-        denom2 += codes[i] * codes[i];
-      }
-      
-      jacc = 1 - num/(denom1 + denom2 - num);
-
-      return jacc;
-        
-    }
-
-  // [[Rcpp::export]]
-  Rcpp::XPtr<DistanceFunctionPtr> jaccard() {
-    return Rcpp::XPtr<DistanceFunctionPtr>(
-    new DistanceFunctionPtr(&myJaccardDef));
-  }'
-  
-  kernels$cosine_code <- '#include <Rcpp.h>
-    typedef double (*DistanceFunctionPtr)(double *, double *, int, int);
-
-    double myCosineDef(double *data, double *codes, int n, int nNA) {
-      if (nNA > 0) return NA_REAL;
-
-      double num = 0.0;
-      double denom1 = 0.0;
-      double denom2 = 0.0;
-      double cosine = 0.0;
-      
-      for (int i = 0; i < n; i++) {
-        num += data[i] * codes[i];
-        denom1 += data[i] * data[i];
-        denom2 += codes[i] * codes[i];
-      }
-      
-      cosine = 1 - num/(sqrt(denom1) + sqrt(denom2));
-
-      return cosine;
-        
-    }
-
-  // [[Rcpp::export]]
-  Rcpp::XPtr<DistanceFunctionPtr> cosine() {
-    return Rcpp::XPtr<DistanceFunctionPtr>(
-    new DistanceFunctionPtr(&myCosineDef));
-  }'
-  
-  kernels$dice_code <- '#include <Rcpp.h>
-    typedef double (*DistanceFunctionPtr)(double *, double *, int, int);
-
-    double myDiceDef(double *data, double *codes, int n, int nNA) {
-      if (nNA > 0) return NA_REAL;
-
-      double num = 0.0;
-      double denom1 = 0.0;
-      double denom2 = 0.0;
-      double dice = 0.0;
-      
-      for (int i = 0; i < n; i++) {
-        num += (data[i] - codes[i]) * (data[i] - codes[i]);
-        denom1 += data[i] * data[i];
-        denom2 += codes[i] * codes[i];
-      }
-      
-      dice = num/(denom1 + denom2);
-
-      return dice;
-        
-    }
-
-  // [[Rcpp::export]]
-  Rcpp::XPtr<DistanceFunctionPtr> dice() {
-    return Rcpp::XPtr<DistanceFunctionPtr>(
-    new DistanceFunctionPtr(&myDiceDef));
-  }'
-  
-  
-  kernels %>% 
-    walk(function(x) sourceCpp(code = x))
   
 # helper functions -----
 
@@ -426,7 +295,7 @@
                    y = .data[[y_var]]))
       
     } else {
-      
+
       pplot <- data %>% 
         ggplot(aes(x = .data[[x_var]], 
                    y = .data[[y_var]], 
@@ -1523,7 +1392,8 @@
                                 nearest_n = 5, 
                                 simple_vote = TRUE, 
                                 kernel_fun = function(x) 1/x, 
-                                seed = 1234) {
+                                seed = 1234, 
+                                .parallel = FALSE) {
     
     ## cross validation of an existing clustering object
     
@@ -1546,6 +1416,7 @@
                        distance_method = distance_method, 
                        clustering_fun = hcluster, 
                        seed = seed, 
+                       .parallel = .parallel, 
                        k = nrow(ngroups(clust_analysis_object)), 
                        hc_method = clust_analysis_object$hc_method, 
                        !!!clust_analysis_object$dots)
@@ -1562,6 +1433,7 @@
                        clustering_fun = kcluster, 
                        clust_fun = clust_analysis_object$clust_fun, 
                        seed = seed, 
+                       .parallel = .parallel, 
                        k = nrow(ngroups(clust_analysis_object)), 
                        !!!clust_analysis_object$dots)
       
@@ -1576,6 +1448,7 @@
                          distance_method = distance_method, 
                          clustering_fun = som_cluster, 
                          seed = seed, 
+                         .parallel = .parallel, 
                          xdim = clust_analysis_object$grid$xdim, 
                          ydim = clust_analysis_object$grid$ydim, 
                          topo = clust_analysis_object$grid$topo, 
@@ -1594,13 +1467,14 @@
                                 nearest_n = 5, 
                                 simple_vote = TRUE, 
                                 kernel_fun = function(x) 1/x, 
-                                seed = 1234) {
+                                seed = 1234, 
+                                .parallel = FALSE) {
     
     ## cross validation of an existing combi object
     
     stopifnot(class(combi_analysis_object) == 'combi_analysis')
     
-    ## common paramaters
+    ## common parameters
     
     node_clust_fun <- switch(combi_analysis_object$clust_analyses$node$clust_fun, 
                              hclust = hcluster, 
@@ -1615,6 +1489,7 @@
                      kernel_fun = kernel_fun, 
                      clustering_fun = combi_cluster, 
                      seed = seed, 
+                     .parallel = .parallel, 
                      distance_som = combi_analysis_object$clust_analyses$observation$dist_method,
                      xdim = combi_analysis_object$clust_analyses$observation$grid$xdim, 
                      ydim = combi_analysis_object$clust_analyses$observation$grid$ydim, 
@@ -2037,15 +1912,15 @@
                               paste('comp', 1:(ncol(loadings) - 1), sep = '_')))
       
     }
-    
+
     component_tbl <- component_tbl %>% 
       as.data.frame %>% 
-      rownames_to_column('observation') %>% 
+      mutate(observation = rownames(data))  %>% 
       as_tibble
     
     component_tbl <- set_names(component_tbl, 
-                               c('observation', 
-                                 paste('comp', 1:(ncol(component_tbl) - 1), sep = '_')))
+                               c(paste('comp', 1:(ncol(component_tbl) - 1), sep = '_')), 
+                               'observation')
     
     ## output
     
@@ -2128,33 +2003,47 @@
     
     ## kNN calulation and label assingment
     
-    knn_dists <- kNN(as.dist(mix_diss), k = k)
+    knn_dists <- kNN(as.dist(mix_diss), k = nrow(mix_diss) - 1)
     
     knn_test <- list(dist = knn_dists$dist[rownames(newdata), ], 
                      id = knn_dists$id[rownames(newdata), ])
     
-    knn_test$annot_id <- matrix(rownames(mix_diss)[knn_test$id], ncol = k)
+    knn_test$annot_id <- matrix(rownames(mix_diss)[knn_test$id], ncol = nrow(mix_diss) - 1)
     rownames(knn_test$annot_id) <- rownames(knn_test$id)
     
-    knn_test$labels <- matrix(label_vec[knn_test$annot_id], ncol = k)
+    knn_test$labels <- matrix(label_vec[knn_test$annot_id], ncol = nrow(mix_diss) - 1)
     rownames(knn_test$labels) <- rownames(knn_test$id)
     
-    ## voting
+    ## voting, constrained to the k-nearest neighbors from the train dataset
     
     if(simple_vote) {
       
       clust_assignment <- rownames(knn_test$labels) %>% 
-        map(~vote_simple(knn_test$labels[.x, ])) %>% 
+        map(~knn_test$labels[.x, ]) %>% 
+        map(~.x[!is.na(.x)][1:k]) %>% 
+        map(vote_simple) %>% 
         unlist
       
     } else {
       
-      clust_assignment <- rownames(knn_test$labels) %>% 
-        map(~vote_kernel(vector = knn_test$labels[.x, ], 
-                         dist_vec = knn_test$dist[.x, ], 
-                         kernel_fun = kernel_fun)) %>% 
-        unlist
+      rows <- rownames(knn_test$labels) %>% 
+        map(~knn_test$labels[.x, ])
       
+      dists <- rownames(knn_test$labels) %>% 
+        map(~knn_test$dist[.x, ])
+      
+      non_na <- rows %>% 
+        map(~!is.na(.x))
+      
+      rows <- map2(rows, non_na, ~.x[.y][1:k])
+      dists <- map2(dists, non_na, ~.x[.y][1:k])
+      
+      clust_assignment <- list(vector = rows, 
+                               dist_vec = dists) %>% 
+        pmap(vote_kernel, 
+             kernel_fun = kernel_fun) %>% 
+        unlist
+
     }
 
     model_frame <- enexpr(newdata)
@@ -2191,9 +2080,14 @@
                          simple_vote = TRUE, 
                          kernel_fun = function(x) 1/x, 
                          clustering_fun = kcluster, 
-                         seed = 1234, ...) {
+                         seed = 1234, 
+                         .parallel = FALSE, ...) {
     
     ## tests stability of the clustering algorithm by cross validation
+    
+    start_time <- Sys.time()
+    message(paste('CV for', nfolds, 'folds'))
+    on.exit(message(paste('Elapsed:', Sys.time() - start_time)))
 
     set.seed(seed = seed)
     
@@ -2215,8 +2109,42 @@
     
     ## creating the training set classifiers
     
-    train_classif <- fold_set$train %>% 
-      map(function(x) clustering_fun(data = x, ...))
+    if(.parallel) {
+      
+      plan('multisession')
+
+      train_classif <- fold_set$train %>% 
+        future_map(function(x) clustering_fun(data = x, ...), 
+                   .options = furrr_options(seed = TRUE, 
+                                            packages = c('tidyverse', 
+                                                         'rlang', 
+                                                         'cluster', 
+                                                         'kohonen', 
+                                                         'dbscan', 
+                                                         'Rcpp', 
+                                                         'myKernels2'), 
+                                            globals = c('hcluster', 
+                                                        'kcluster', 
+                                                        'som_cluster', 
+                                                        'dbscan_cluster', 
+                                                        'combi_cluster', 
+                                                        'clust_analysis', 
+                                                        'combi_analysis', 
+                                                        'calculate_dist', 
+                                                        'getDistMethods', 
+                                                        'source_kernels', 
+                                                        'extract', 
+                                                        'extract.clust_analysis', 
+                                                        'stri_replace')))
+      
+      plan('sequential')
+      
+    } else {
+      
+      train_classif <- fold_set$train %>% 
+        map(function(x) clustering_fun(data = x, ...))
+      
+    }
     
     ## obtaining the predictions and comparing with the global classifier
     
@@ -2304,6 +2232,74 @@
     
     list(variances = var_lst, 
          summary = var_summary[c('variable', 'frac_diff')])
+    
+  }
+  
+# Varia -----
+  
+  plot_clust_hm <- function(sample_combi_object, 
+                            ft_clust_object, 
+                            plot_title = NULL, 
+                            plot_subtitle = NULL, 
+                            cust_theme = theme_classic()) {
+    
+    ## plots clustering features as a heat map
+    
+    stopifnot(class(sample_combi_object) == 'combi_analysis')
+    stopifnot(class(ft_clust_object) == 'clust_analysis')
+    
+    ## assignment list
+    
+    cmm_assignment <- list(sample_combi_object, 
+                           ft_clust_object) %>% 
+      map(extract, type = 'assignment') %>% 
+      map2(list(c('sample', 'sample_node', 'sample_clust'), 
+                c('feature', 'ft_clust')), 
+           set_names)
+    
+    ## data in a long format
+    
+    data <- extract(sample_combi_object, type = 'data')[[1]] %>% 
+      as_tibble %>% 
+      mutate(sample = cmm_assignment[[1]]$sample) %>% 
+      gather(key = 'feature', 
+             value = 'value', 
+             all_of(cmm_assignment[[2]]$feature))
+    
+    ## joining the data table with the cluster assignment information
+    
+    data <- left_join(data, cmm_assignment[[1]], by = 'sample') %>% 
+      left_join(cmm_assignment[[2]], by = 'feature')
+    
+    ## plot tag with the sample n numbers
+    
+    n_tag <- ngroups(sample_combi_object)
+    
+    n_tag <- map2_chr(n_tag$clust_id, 
+                      n_tag$n, 
+                      ~paste0(.x, ': n = ', .y)) %>% 
+      paste(collapse = ', ')
+    
+    ## plotting
+    
+    data %>% 
+      ggplot(aes(x = reorder(sample, as.numeric(sample_node)), 
+                 y = reorder(feature, value), 
+                 fill = value)) + 
+      geom_tile() + 
+      cust_theme + 
+      theme(axis.title.y = element_blank(), 
+            panel.background = element_blank(), 
+            axis.line = element_blank(), 
+            axis.text.x = element_blank(), 
+            axis.ticks.x = element_blank()) + 
+      labs(title = plot_title,
+           subtitle = plot_subtitle, 
+           tag = n_tag, 
+           x = 'Sample') + 
+      facet_grid(ft_clust ~ sample_clust, 
+                 scales = 'free', 
+                 space = 'free')
     
   }
   
